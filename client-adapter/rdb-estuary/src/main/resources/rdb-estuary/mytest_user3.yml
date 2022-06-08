@@ -1,0 +1,14 @@
+dataSourceKey: defaultDS
+destination: example
+groupId: g1
+outerAdapterKey: mysql1
+concurrent: true
+dbMapping:
+  sql: "select t1.main_id, sum(t1.num*t2.price) total_amount
+        from t_detail t1
+        left join t_product t2
+        on t1.prod_code = t2.prod_code
+        group by t1.main_id"
+  targetDb: esturay
+  targetTable: t_result3
+  commitBatch: 3000 # 批量提交的大小

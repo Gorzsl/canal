@@ -1,0 +1,16 @@
+dataSourceKey: defaultDS
+destination: example
+groupId: g1
+outerAdapterKey: mysql1
+concurrent: true
+dbMapping:
+  sql: "select t1.id, t1.code, t1.status, t1.remark, t2.prod_code, t2.num, t3.price, t2.num*t3.price amount
+        from t_main t1
+        left join t_detail t2
+        on t1.id = t2.main_id
+        left join t_product t3
+        on t2.prod_code = t3.prod_code"
+  targetDb: esturay
+  targetTable: t_result
+  _id: id # 主表的主键(或者其他能标识主表唯一行的字段) 对应的目标表中的字段名(带groupBy的情况不需要配置)
+  commitBatch: 3000 # 批量提交的大小

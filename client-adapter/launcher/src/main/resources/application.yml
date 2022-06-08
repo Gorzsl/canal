@@ -46,17 +46,23 @@ canal.conf:
     rabbitmq.password:
     rabbitmq.resource.ownerId:
 
-#  srcDataSources:
-#    defaultDS:
-#      url: jdbc:mysql://127.0.0.1:3306/mytest?useUnicode=true
-#      username: root
-#      password: 121212
+  srcDataSources:
+    defaultDS:
+      url: jdbc:mysql://localhost:3306/esturay?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Hongkong
+      username: root
+      password: 121212
   canalAdapters:
   - instance: example # canal instance Name or mq topic name
     groups:
     - groupId: g1
       outerAdapters:
-      - name: logger
+      - name: rdb-estuary
+        key: mysql1
+        properties:
+          jdbc.driverClassName: com.mysql.jdbc.Driver
+          jdbc.url: jdbc:mysql://localhost:3306/esturay?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Hongkong
+          jdbc.username: root
+          jdbc.password: 121212
 #      - name: rdb
 #        key: mysql1
 #        properties:
