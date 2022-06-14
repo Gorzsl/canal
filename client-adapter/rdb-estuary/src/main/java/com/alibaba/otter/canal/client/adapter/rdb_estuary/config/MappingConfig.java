@@ -94,7 +94,7 @@ public class MappingConfig implements AdapterConfig {
         private String              targetTable;                             // 目标表名
 
         private String              _id;                                     // 主表的主键(或者其他能标识主表唯一行的字段) 对应的目标表中的字段名(带groupBy的情况不需要配置)
-
+        private String              deleteCondition;                         // 用于拼接在delete语句的where条件中
         private int                 commitBatch     = 5000;                  // etl等批量提交大小
 
         private SchemaItem          schemaItem;                              // sql解析结果模型
@@ -133,6 +133,14 @@ public class MappingConfig implements AdapterConfig {
 
         public String getEtlCondition() {
             throw new UnsupportedOperationException();
+        }
+
+        public void setDeleteCondition(String deleteCondition) {
+            this.deleteCondition = deleteCondition;
+        }
+
+        public String getDeleteCondition() {
+            return deleteCondition;
         }
 
         public int getCommitBatch() {

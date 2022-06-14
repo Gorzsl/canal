@@ -140,7 +140,12 @@ public class EtlService extends AbstractEtlService {
             DruidDataSource dataSource = DatasourceConfig.DATA_SOURCES.get(config.getDataSourceKey());
 
             //清空目标表
-            String truncateSql = "TRUNCATE " + SyncUtil.getDbTableName(config.getDbMapping());
+            String truncateSql = null;
+            if (config.getDbMapping().getDeleteCondition() == null || config.getDbMapping().getDeleteCondition().isEmpty()) {
+                truncateSql = "TRUNCATE " + SyncUtil.getDbTableName(config.getDbMapping());
+            } else {
+                truncateSql = "DELETE FROM "+SyncUtil.getDbTableName(config.getDbMapping())+" WHERE "+config.getDbMapping().getDeleteCondition();
+            }
             try (Connection connTarget = targetDS.getConnection();
                  PreparedStatement pstmt = connTarget.prepareStatement(truncateSql)) {
                 if (logger.isDebugEnabled()) {

@@ -48,6 +48,7 @@ dbMapping:
   targetDb: esturay      # 目标库
   targetTable: t_result  # 目标表
   _id: id                # 主表的主键(或者其他能标识主表唯一行的字段) 对应的目标表中的字段名(带groupBy的情况不需要配置)
+  deleteCondition:       # 用于数据同步时目标表删除语句中添加条件(可用于union all视图的同步)
   commitBatch: 3000      # 批量提交的大小
 ```
 
@@ -60,7 +61,7 @@ dbMapping:
 6. 非group by模式下关联条件中的左表字段必须出现在主查询语句中比如: on t1.role_id=t2.id 其中的 t1.role_id 必须出现在主select语句中
 7. 如果使用了group by,group by的字段不可为做任何计算,group 字段必须在查询字段中体现(简单字段)
 8. 非group by模式必须设置主键，主键字段在目标表允许重复，主键字段必须设置在主表上，且不可被更新
-9. 当然不支持union all
+9. 如果需要使用union all的话，建议在unionAll语句的各个分段中添加常量字段，然后每个分段分别添加相应的配置文件指向同一个目标表，并且配置deleteCondition(例如:常量字段在目标表的字段名=分段对应的常量值)
 
 # 执行逻辑：
 ## insert:
@@ -81,10 +82,11 @@ dbMapping:
 ## update：
 1. 无group
     1. sql语句中只有单一表&所有查询字段均为简单字段：目标表执行update set where 主键=dml.data.主键的值
-    2. 遍历所有表匹配表名(有同名表需要执行多次)
+    2. sql语句中只有单一表&所有查询字段不均为简单字段
+        1. 目标表执行delete where 主键=dml.data.主键的值
+        2. 执行查询(原始sql注入条件 主键=dml.data.主键的值)
+    3. 遍历所有表匹配表名(有同名表需要执行多次)
         1. 更新的字段在 查询字段/关联前表的字段/被后表关联的字段 中无引用：跳过
-        ~~2. 引用了该表更新字段的查询的字段均为简单字段 & 该表关联其他表/其他表关联了该表的字段没有被更新：update 目标表 set 该表在查询中的字段=dml.data.value where 关联/被关联字段=dml.data.value~~
-        ~~3. 存在非简单查询字段引用了该表更新字段：~~
         2. 关联前后表的字段没有发生更新
             1. 目标表执行 delete where 该表关联前后表的字段 = dml.data.相关字段的值
             2. 执行查询(sql注入where 该表关联前后表的字段 = dml.data.相关字段的值) 查询结果插入目标表
@@ -108,10 +110,8 @@ dbMapping:
 1. 无group
     1. 是主表：目标表执行delete where 主键=dml.data.主键的值
     2. 非主表：遍历从表匹配表名(有同名表需要执行多次)
-        1. ~~没有其他表join该表&该表在查询中的字段均为简单字段：update set相关查询字段=null where 该表join其他表用的字段=dml.data.value~~
-        2. 其他：
-            1. 目标表执行delete where on字段(关联前表的字段对应的查询字段) = dml.data.相关字段的值
-            2. 执行查询(原始sql注入where on字段(关联前表的字段)=dml.data.相关字段的值) 查询结果插入目标表
+        1. 目标表执行delete where on字段(关联前表的字段对应的查询字段) = dml.data.相关字段的值
+        2. 执行查询(原始sql注入where on字段(关联前表的字段)=dml.data.相关字段的值) 查询结果插入目标表
 2. 有group
     1. 该表在group中有涉及字段：
             1. 目标表执行 delete where group字段=dml.data.value

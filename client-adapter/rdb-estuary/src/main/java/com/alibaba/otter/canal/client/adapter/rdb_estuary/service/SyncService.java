@@ -328,8 +328,12 @@ public class SyncService {
             }
 
         } else {//无group by
-            if (schemaItem.getAliasTableItems().size() == 1 && schemaItem.isAllFieldsSimple()){//单表&所有字段都是简单字段
-                singleTableSimpleFieldUpdate(config, batchExecutor, ctype, dml);
+            if (schemaItem.getAliasTableItems().size() == 1){//单表
+                if (schemaItem.isAllFieldsSimple()) {//所有字段都是简单字段
+                    singleTableSimpleFieldUpdate(config, batchExecutor, ctype, dml);
+                } else {
+                    mainTableUpdate(config, ds, batchExecutor, ctype, dml);
+                }
             } else {
                 for (SchemaItem.TableItem tableItem : schemaItem.getAliasTableItems().values()) {
                     if (!tableItem.getTableName().equalsIgnoreCase(dml.getTable())) {
@@ -558,6 +562,9 @@ public class SyncService {
     private void truncateAndInsert(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype) throws SQLException{
         //清空目标表
         String truncateSql = "DELETE FROM " + SyncUtil.getDbTableName(config.getDbMapping());
+        if (config.getDbMapping().getDeleteCondition() != null && !config.getDbMapping().getDeleteCondition().isEmpty()){
+            truncateSql = truncateSql + " WHERE " + config.getDbMapping().getDeleteCondition();
+        }
         batchExecutor.execute(truncateSql, new ArrayList<>());
         if (logger.isTraceEnabled()) {
             logger.trace("truncate target table, sql: {}", truncateSql);
@@ -567,6 +574,116 @@ public class SyncService {
         searchAndInsertTargetTable(config, ds, batchExecutor, ctype, config.getDbMapping().getSql(), new ArrayList<>());
     }
 
+    private void singleTableSimpleFieldInsert(MappingConfig config, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException{
+        String insertSql = getInsertSql(config.getDbMapping());
+        List<Map<String, ?>> insertValues = new ArrayList<>();
+        for (SchemaItem.FieldItem fieldItem : config.getDbMapping().getSchemaItem().getSelectFields().values()) {
+            Object value = dml.getData().get(fieldItem.getColumn().getColumnName());
+            Integer type = ctype.get(fieldItem.getFieldName());
+            if (type == null) {
+                throw new RuntimeException("Target column: " + fieldItem.getFieldName() + " not matched");
+            }
+            BatchExecutor.setValue(insertValues, type, value);
+        }
+
+        insertTargetTable(batchExecutor, insertSql, insertValues);
+    }
+
+    private void singleTableSimpleFieldUpdate(MappingConfig config, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException {
+        SchemaItem schemaItem = config.getDbMapping().getSchemaItem();
+
+        List<Map<String, ?>> updateParams = new ArrayList<>();
+        StringBuilder updateSql = new StringBuilder();
+        updateSql.append("UPDATE ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" SET ");
+        for (SchemaItem.FieldItem fieldItem : schemaItem.getSelectFields().values()) {
+            updateSql.append(fieldItem.getFieldName());
+            Object value = dml.getData().get(fieldItem.getColumn().getColumnName());
+            if (value == null){
+                updateSql.append(" = null,");
+            } else {
+                updateSql.append(" = ?,");
+                Integer type = ctype.get(fieldItem.getFieldName());
+                if (type == null) {
+                    throw new RuntimeException("Target column: " + fieldItem.getFieldName() + " not matched");
+                }
+                BatchExecutor.setValue(updateParams, type, value);
+            }
+        }
+        int len = updateSql.length();
+        updateSql.delete(len - 1, len);
+
+        updateSql.append(" WHERE ").append(config.getDbMapping().get_id());
+        SchemaItem.FieldItem idField = schemaItem.getSelectFields().get(config.getDbMapping().get_id());
+        Object value = dml.getData().get(idField.getColumn().getColumnName());
+        if (value == null){
+            updateSql.append(" IS NULL ");
+        } else {
+            updateSql.append(" = ? ");
+            Integer type = ctype.get(idField.getFieldName());
+            if (type == null) {
+                throw new RuntimeException("Target column: " + idField.getFieldName() + " not matched");
+            }
+            BatchExecutor.setValue(updateParams, type, value);
+        }
+        if (config.getDbMapping().getDeleteCondition() != null && !config.getDbMapping().getDeleteCondition().isEmpty()){
+            updateSql.append(" AND ").append(config.getDbMapping().getDeleteCondition());
+        }
+        batchExecutor.execute(updateSql.toString(), updateParams);
+        if (logger.isTraceEnabled()) {
+            logger.trace("update target table, sql: {}", updateSql.toString());
+        }
+    }
+
+    private void mainTableInsert(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException{
+        DbMapping dbMapping = config.getDbMapping();
+
+        List<Object> selectParams = new ArrayList<>();
+        StringBuilder selectWhere = new StringBuilder();
+        SchemaItem.FieldItem idField = dbMapping.getSchemaItem().getSelectFields().get(dbMapping.get_id());
+        selectWhere.append(idField.getColumn().getOwner()).append(".").append(idField.getColumn().getColumnName());
+        Object value = dml.getData().get(idField.getColumn().getColumnName());
+        if (value == null){
+            selectWhere.append(" IS NULL ");
+        } else {
+            selectWhere.append(" = ? ");
+            selectParams.add(value);
+        }
+        String selectSql = SyncUtil.injectionWhere(dbMapping.getSql(), selectWhere.toString());
+        searchAndInsertTargetTable(config, ds, batchExecutor, ctype, selectSql, selectParams);
+    }
+
+    private void mainTableDelete(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException {
+        DbMapping dbMapping = config.getDbMapping();
+
+        List<Map<String, ?>> deleteParams = new ArrayList<>();
+        StringBuilder deleteSql = new StringBuilder();
+        deleteSql.append("DELETE FROM ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" WHERE ").append(dbMapping.get_id());
+        SchemaItem.FieldItem idField = dbMapping.getSchemaItem().getSelectFields().get(dbMapping.get_id());
+        Object value = dml.getData().get(idField.getColumn().getColumnName());
+        if (value == null){
+            deleteSql.append(" IS NULL ");
+        } else {
+            deleteSql.append(" = ? ");
+            Integer type = ctype.get(idField.getFieldName());
+            if (type == null) {
+                throw new RuntimeException("Target column: " + idField.getFieldName() + " not matched");
+            }
+            BatchExecutor.setValue(deleteParams, type, value);
+        }
+        if (config.getDbMapping().getDeleteCondition() != null && !config.getDbMapping().getDeleteCondition().isEmpty()){
+            deleteSql.append(" AND ").append(config.getDbMapping().getDeleteCondition());
+        }
+        batchExecutor.execute(deleteSql.toString(), deleteParams);
+        if (logger.isTraceEnabled()) {
+            logger.trace("delete target table, sql: {}", deleteSql.toString());
+        }
+    }
+
+    private void mainTableUpdate(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException {
+        mainTableDelete(config, ds, batchExecutor, ctype, dml);
+        mainTableInsert(config, ds, batchExecutor, ctype, dml);
+    }
+
     private void syncByGroupField(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype
             , SchemaItem.TableItem tableItem, Map<String, Object> data, Map<String, Object> old) throws SQLException{
         SchemaItem schemaItem = config.getDbMapping().getSchemaItem();
@@ -574,6 +691,9 @@ public class SyncService {
         List<Map<String, ?>> deleteParams = new ArrayList<>();
         StringBuilder deleteSql = new StringBuilder();
         deleteSql.append("DELETE FROM ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" WHERE ");
+        if (config.getDbMapping().getDeleteCondition() != null && !config.getDbMapping().getDeleteCondition().isEmpty()){
+            deleteSql.append(config.getDbMapping().getDeleteCondition()).append(" AND ");
+        }
         for (SchemaItem.FieldItem fieldItem : tableItem.getRelationGroupFieldItems()) {
             SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
             List<SchemaItem.FieldItem> fieldItems = schemaItem.getColumnFields().get(columnItem.getOwner() + "." + columnItem.getColumnName());//group字段相关的查询字段
@@ -633,210 +753,6 @@ public class SyncService {
         searchAndInsertTargetTable(config, ds, batchExecutor, ctype, selectSql, selectParams);
     }
 
-    private void singleTableSimpleFieldInsert(MappingConfig config, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException{
-        String insertSql = getInsertSql(config.getDbMapping());
-        List<Map<String, ?>> insertValues = new ArrayList<>();
-        for (SchemaItem.FieldItem fieldItem : config.getDbMapping().getSchemaItem().getSelectFields().values()) {
-            Object value = dml.getData().get(fieldItem.getColumn().getColumnName());
-            Integer type = ctype.get(fieldItem.getFieldName());
-            if (type == null) {
-                throw new RuntimeException("Target column: " + fieldItem.getFieldName() + " not matched");
-            }
-            BatchExecutor.setValue(insertValues, type, value);
-        }
-
-        insertTargetTable(batchExecutor, insertSql, insertValues);
-    }
-
-    private void mainTableInsert(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException{
-        DbMapping dbMapping = config.getDbMapping();
-
-        List<Object> selectParams = new ArrayList<>();
-        StringBuilder selectWhere = new StringBuilder();
-        SchemaItem.FieldItem idField = dbMapping.getSchemaItem().getSelectFields().get(dbMapping.get_id());
-        selectWhere.append(idField.getColumn().getOwner()).append(".").append(idField.getColumn().getColumnName());
-        Object value = dml.getData().get(idField.getColumn().getColumnName());
-        if (value == null){
-            selectWhere.append(" IS NULL ");
-        } else {
-            selectWhere.append(" = ? ");
-            selectParams.add(value);
-        }
-        String selectSql = SyncUtil.injectionWhere(dbMapping.getSql(), selectWhere.toString());
-        searchAndInsertTargetTable(config, ds, batchExecutor, ctype, selectSql, selectParams);
-    }
-
-    private void mainTableDelete(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException {
-        DbMapping dbMapping = config.getDbMapping();
-
-        List<Map<String, ?>> deleteParams = new ArrayList<>();
-        StringBuilder deleteSql = new StringBuilder();
-        deleteSql.append("DELETE FROM ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" WHERE ").append(dbMapping.get_id());
-        SchemaItem.FieldItem idField = dbMapping.getSchemaItem().getSelectFields().get(dbMapping.get_id());
-        Object value = dml.getData().get(idField.getColumn().getColumnName());
-        if (value == null){
-            deleteSql.append(" IS NULL ");
-        } else {
-            deleteSql.append(" = ? ");
-            Integer type = ctype.get(idField.getFieldName());
-            if (type == null) {
-                throw new RuntimeException("Target column: " + idField.getFieldName() + " not matched");
-            }
-            BatchExecutor.setValue(deleteParams, type, value);
-        }
-        batchExecutor.execute(deleteSql.toString(), deleteParams);
-        if (logger.isTraceEnabled()) {
-            logger.trace("delete target table, sql: {}", deleteSql.toString());
-        }
-    }
-
-    private void simpleFieldTableDelete(MappingConfig config, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml, SchemaItem.TableItem tableItem) throws SQLException {
-        SchemaItem schemaItem = config.getDbMapping().getSchemaItem();
-
-        List<Map<String, ?>> updateParams = new ArrayList<>();
-        StringBuilder updateSql = new StringBuilder();
-        updateSql.append("UPDATE ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" SET ");
-        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationSelectFieldItems()) {
-            updateSql.append(fieldItem.getFieldName()).append(" = null,");
-        }
-        int len = updateSql.length();
-        updateSql.delete(len - 1, len);
-        updateSql.append(" WHERE ");
-        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationTableFields().keySet()) {
-            SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
-            List<SchemaItem.FieldItem> fieldItems = tableItem.getRelationTableFields().get(fieldItem);//关联前表的on字段相关的查询字段
-            for (SchemaItem.FieldItem item : fieldItems) {
-                if (item.isBinaryOp() || item.isMethod()){
-                    continue;
-                }
-                String targetFieldName = item.getFieldName();
-                updateSql.append(targetFieldName);
-                Object value = dml.getData().get(columnItem.getColumnName());
-                if (value == null){
-                    updateSql.append(" IS NULL AND ");
-                } else {
-                    updateSql.append(" = ? AND ");
-                    Integer type = ctype.get(targetFieldName);
-                    if (type == null) {
-                        throw new RuntimeException("Target column: " + targetFieldName + " not matched");
-                    }
-                    BatchExecutor.setValue(updateParams, type, value);
-                }
-            }
-        }
-        len = updateSql.length();
-        updateSql.delete(len - 4, len);
-        batchExecutor.execute(updateSql.toString(), updateParams);
-        if (logger.isTraceEnabled()) {
-            logger.trace("update target table, sql: {}", updateSql.toString());
-        }
-    }
-
-    private void singleTableSimpleFieldUpdate(MappingConfig config, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml) throws SQLException {
-        SchemaItem schemaItem = config.getDbMapping().getSchemaItem();
-
-        List<Map<String, ?>> updateParams = new ArrayList<>();
-        StringBuilder updateSql = new StringBuilder();
-        updateSql.append("UPDATE ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" SET ");
-        for (SchemaItem.FieldItem fieldItem : schemaItem.getSelectFields().values()) {
-            updateSql.append(fieldItem.getFieldName());
-            Object value = dml.getData().get(fieldItem.getColumn().getColumnName());
-            if (value == null){
-                updateSql.append(" = null,");
-            } else {
-                updateSql.append(" = ?,");
-                Integer type = ctype.get(fieldItem.getFieldName());
-                if (type == null) {
-                    throw new RuntimeException("Target column: " + fieldItem.getFieldName() + " not matched");
-                }
-                BatchExecutor.setValue(updateParams, type, value);
-            }
-        }
-        int len = updateSql.length();
-        updateSql.delete(len - 1, len);
-
-        updateSql.append(" WHERE ").append(config.getDbMapping().get_id());
-        SchemaItem.FieldItem idField = schemaItem.getSelectFields().get(config.getDbMapping().get_id());
-        Object value = dml.getData().get(idField.getColumn().getColumnName());
-        if (value == null){
-            updateSql.append(" IS NULL ");
-        } else {
-            updateSql.append(" = ? ");
-            Integer type = ctype.get(idField.getFieldName());
-            if (type == null) {
-                throw new RuntimeException("Target column: " + idField.getFieldName() + " not matched");
-            }
-            BatchExecutor.setValue(updateParams, type, value);
-        }
-        batchExecutor.execute(updateSql.toString(), updateParams);
-        if (logger.isTraceEnabled()) {
-            logger.trace("update target table, sql: {}", updateSql.toString());
-        }
-    }
-
-    private void simpleFieldUpdate(MappingConfig config, BatchExecutor batchExecutor, Map<String, Integer> ctype, SingleDml dml, SchemaItem.TableItem tableItem) throws SQLException {
-        SchemaItem schemaItem = config.getDbMapping().getSchemaItem();
-
-        List<Map<String, ?>> updateParams = new ArrayList<>();
-        StringBuilder updateSql = new StringBuilder();
-        updateSql.append("UPDATE ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" SET ");
-        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationSelectFieldItems()) {
-            if (fieldItem.isMethod() || fieldItem.isBinaryOp()){
-                continue;
-            }
-            if (dml.getOld().containsKey(fieldItem.getColumn().getColumnName())){
-                updateSql.append(fieldItem.getFieldName());
-                Object value = dml.getData().get(fieldItem.getColumn().getColumnName());
-                if (value == null){
-                    updateSql.append(" = null,");
-                } else {
-                    updateSql.append(" = ?,");
-                    Integer type = ctype.get(fieldItem.getFieldName());
-                    if (type == null) {
-                        throw new RuntimeException("Target column: " + fieldItem.getFieldName() + " not matched");
-                    }
-                    BatchExecutor.setValue(updateParams, type, value);
-                }
-            }
-        }
-        int len = updateSql.length();
-        updateSql.delete(len - 1, len);
-
-        updateSql.append(" WHERE ");
-        Set<SchemaItem.FieldItem> onFields = new HashSet<>();
-        onFields.addAll(tableItem.getRelationTableFields().keySet());
-        onFields.addAll(tableItem.getAnotherRelationTableFields().keySet());
-        for (SchemaItem.FieldItem fieldItem : onFields) {
-            SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
-            List<SchemaItem.FieldItem> fieldItems = tableItem.getRelationTableFields().get(fieldItem);//关联前表的on字段相关的查询字段
-            for (SchemaItem.FieldItem item : fieldItems) {
-                if (item.isBinaryOp() || item.isMethod()){
-                    continue;
-                }
-                String targetFieldName = item.getFieldName();
-                updateSql.append(targetFieldName);
-                Object value = dml.getData().get(columnItem.getColumnName());
-                if (value == null){
-                    updateSql.append(" IS NULL AND ");
-                } else {
-                    updateSql.append(" = ? AND ");
-                    Integer type = ctype.get(targetFieldName);
-                    if (type == null) {
-                        throw new RuntimeException("Target column: " + targetFieldName + " not matched");
-                    }
-                    BatchExecutor.setValue(updateParams, type, value);
-                }
-            }
-        }
-        len = updateSql.length();
-        updateSql.delete(len - 4, len);
-
-        batchExecutor.execute(updateSql.toString(), updateParams);
-        if (logger.isTraceEnabled()) {
-            logger.trace("update target table, sql: {}", updateSql.toString());
-        }
-    }
-
     private void syncByLeftOnField(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype
             , SchemaItem.TableItem tableItem, Map<String, Object> data, Map<String, Object> old) throws SQLException{
         SchemaItem schemaItem = config.getDbMapping().getSchemaItem();
@@ -844,6 +760,9 @@ public class SyncService {
         List<Map<String, ?>> deleteParams = new ArrayList<>();
         StringBuilder deleteSql = new StringBuilder();
         deleteSql.append("DELETE FROM ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" WHERE ");
+        if (config.getDbMapping().getDeleteCondition() != null && !config.getDbMapping().getDeleteCondition().isEmpty()){
+            deleteSql.append(config.getDbMapping().getDeleteCondition()).append(" AND ");
+        }
         for (SchemaItem.FieldItem fieldItem : tableItem.getRelationTableFields().keySet()) {
             SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
             List<SchemaItem.FieldItem> fieldItems = tableItem.getRelationTableFields().get(fieldItem);//关联前表的on字段相关的查询字段
@@ -881,11 +800,11 @@ public class SyncService {
             SchemaItem.ColumnItem leftColumnItem = null;//对应的关联字段
             for (SchemaItem.RelationFieldsPair relationField : tableItem.getRelationFields()) {
                 if (relationField.getLeftFieldItem() == fieldItem){
-                    leftColumnItem = relationField.getLeftFieldItem().getColumn();
+                    leftColumnItem = relationField.getRightFieldItem().getColumn();
                     break;
                 }
                 if (relationField.getRightFieldItem() == fieldItem){
-                    leftColumnItem = relationField.getRightFieldItem().getColumn();
+                    leftColumnItem = relationField.getLeftFieldItem().getColumn();
                     break;
                 }
             }
@@ -927,6 +846,9 @@ public class SyncService {
         List<Map<String, ?>> deleteParams = new ArrayList<>();
         StringBuilder deleteSql = new StringBuilder();
         deleteSql.append("DELETE FROM ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" WHERE ");
+        if (config.getDbMapping().getDeleteCondition() != null && !config.getDbMapping().getDeleteCondition().isEmpty()){
+            deleteSql.append(config.getDbMapping().getDeleteCondition()).append(" AND ");
+        }
         Set<SchemaItem.FieldItem> onFields = new HashSet<>();
         onFields.addAll(tableItem.getRelationTableFields().keySet());
         onFields.addAll(tableItem.getAnotherRelationTableFields().keySet());
@@ -971,11 +893,11 @@ public class SyncService {
                 SchemaItem.ColumnItem leftColumnItem = null;//对应的关联字段
                 for (SchemaItem.RelationFieldsPair relationField : tableItem.getRelationFields()) {
                     if (relationField.getLeftFieldItem() == fieldItem){
-                        leftColumnItem = relationField.getLeftFieldItem().getColumn();
+                        leftColumnItem = relationField.getRightFieldItem().getColumn();
                         break;
                     }
                     if (relationField.getRightFieldItem() == fieldItem){
-                        leftColumnItem = relationField.getRightFieldItem().getColumn();
+                        leftColumnItem = relationField.getLeftFieldItem().getColumn();
                         break;
                     }
                 }

@@ -143,7 +143,7 @@ public class SchemaItem {
                     allFieldsSimple = true;
 
                     for (FieldItem fieldItem : getSelectFields().values()) {
-                        if (fieldItem.isMethod() || fieldItem.isBinaryOp()) {
+                        if (fieldItem.isMethod() || fieldItem.isBinaryOp() || fieldItem.getColumnItems().isEmpty()) {
                             allFieldsSimple = false;
                             break;
                         }
