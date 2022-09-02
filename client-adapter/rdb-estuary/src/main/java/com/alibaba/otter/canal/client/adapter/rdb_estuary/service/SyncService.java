@@ -17,8 +17,14 @@ import org.slf4j.LoggerFactory;
 
 import javax.sql.DataSource;
 import java.sql.SQLException;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.function.Function;
 
 /**
@@ -31,6 +37,8 @@ public class SyncService {
 
     // 目标库表字段类型缓存: instance.schema.table -> <columnName, jdbcType>
     private Map<String, Map<String, Integer>> columnsTypeCache;
+    // 源表字段类型缓存: dataSourceKey.schema.table -> <columnName, jdbcType>
+    private Map<String, Map<String, Integer>> sourceColumnsTypeCache;
 
     private int                               threads = 3;
     private boolean                           skipDupException;
@@ -54,6 +62,7 @@ public class SyncService {
     public SyncService(DataSource dataSource, Integer threads, Map<String, Map<String, Integer>> columnsTypeCache,
                           boolean skipDupException){
         this.columnsTypeCache = columnsTypeCache;
+        this.sourceColumnsTypeCache = new ConcurrentHashMap<>();
         this.skipDupException = skipDupException;
         try {
             if (threads != null) {
@@ -229,23 +238,34 @@ public class SyncService {
         Map<String, Integer> ctype = getTargetColumnType(batchExecutor.getDataSource(), config);
 
         if (schemaItem.isGroup()){//有group by
-            boolean execTruncate = false;//是否执行清空目标表
-
             for (SchemaItem.TableItem tableItem : schemaItem.getAliasTableItems().values()) {
-                if (tableItem.getTableName().equalsIgnoreCase(dml.getTable())
-                        && tableItem.getRelationGroupFieldItems().isEmpty()) {
-                    execTruncate = true;
-                    break;
+                if (!tableItem.getTableName().equalsIgnoreCase(dml.getTable())) {
+                    continue;
                 }
-            }
+                boolean syncByGroup = false;
+                if (!tableItem.getRelationGroupFieldItems().isEmpty()){
+                    syncByGroup = true;
+                } else {
+                    out: for (SchemaItem.RelationFieldsPair fieldsPair : tableItem.getRelationFields()) {
+                        SchemaItem.FieldItem anotherTableRelField = null;
+                        if (!tableItem.getAlias().equals(fieldsPair.getLeftFieldItem().getOwner())) {
+                            anotherTableRelField = fieldsPair.getLeftFieldItem();
+                        } else if (!tableItem.getAlias().equals(fieldsPair.getRightFieldItem().getOwner())) {
+                            anotherTableRelField = fieldsPair.getRightFieldItem();
+                        }
 
-            if (execTruncate){
-                truncateAndInsert(config, ds, batchExecutor, ctype);
-            } else {
-                for (SchemaItem.TableItem tableItem : schemaItem.getAliasTableItems().values()) {
-                    if (tableItem.getTableName().equalsIgnoreCase(dml.getTable())) {
-                        syncByGroupField(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
+                        for (SchemaItem.FieldItem groupByField : schemaItem.getGroupByFields()) {
+                            if (anotherTableRelField.getOwner().equalsIgnoreCase(groupByField.getOwner()) && anotherTableRelField.getColumn().getColumnName().equalsIgnoreCase(groupByField.getColumn().getColumnName())) {
+                                syncByGroup = true;
+                                break out;
+                            }
+                        }
                     }
+                }
+                if (syncByGroup) {
+                    syncByGroupField(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
+                } else {
+                    syncByPreviewGroup(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
                 }
             }
         } else {//无group by
@@ -280,53 +300,66 @@ public class SyncService {
         Map<String, Integer> ctype = getTargetColumnType(batchExecutor.getDataSource(), config);
 
         if (schemaItem.isGroup()) {//有group by
-            boolean execTruncate = false;//是否执行清空目标表
-            boolean fieldNoReference  = true;//被更新的字段是否在查询字段/group字段中未被引用
             for (SchemaItem.TableItem tableItem : schemaItem.getAliasTableItems().values()) {
-                if (tableItem.getTableName().equalsIgnoreCase(dml.getTable())) {
-                    if (tableItem.getRelationGroupFieldItems().isEmpty()) {
-                        execTruncate = true;
-                    }
+                if (!tableItem.getTableName().equalsIgnoreCase(dml.getTable())) {
+                    continue;
+                }
 
-                    out: for (String field : dml.getOld().keySet()) {
-                        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationSelectFieldItems()) {
-                            for (SchemaItem.ColumnItem item : fieldItem.getColumnItems()) {
-                                if (item.getOwner().equalsIgnoreCase(tableItem.getAlias()) && item.getColumnName().equalsIgnoreCase(field)){
-                                    fieldNoReference = false;
-                                    break out;
-                                }
-                            }
-                        }
-                        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationTableFields().keySet()) {
-                            if (fieldItem.getColumn().getColumnName().equalsIgnoreCase(field)){
-                                fieldNoReference = false;
-                                break out;
-                            }
-                        }
-                        for (SchemaItem.FieldItem fieldItem : tableItem.getAnotherRelationTableFields().keySet()) {
-                            if (fieldItem.getColumn().getColumnName().equalsIgnoreCase(field)){
+                boolean fieldNoReference  = true;//被更新的字段是否在查询字段/group字段中未被引用
+                out: for (String field : dml.getOld().keySet()) {
+                    for (SchemaItem.FieldItem fieldItem : tableItem.getRelationSelectFieldItems()) {
+                        for (SchemaItem.ColumnItem item : fieldItem.getColumnItems()) {
+                            if ((item.getOwner() != null && item.getOwner().equalsIgnoreCase(tableItem.getAlias())) && (item.getColumnName() != null && item.getColumnName().equalsIgnoreCase(field))){
                                 fieldNoReference = false;
                                 break out;
                             }
                         }
                     }
-                }
-            }
-
-            if (fieldNoReference){//更新的字段在查询字段(group字段)中未被引用
-                return;
-            }
-            if (execTruncate){
-                truncateAndInsert(config, ds, batchExecutor, ctype);
-            } else {
-                for (SchemaItem.TableItem tableItem : schemaItem.getAliasTableItems().values()) {
-                    if (tableItem.getTableName().equalsIgnoreCase(dml.getTable())) {
-                        syncByGroupField(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
-                        syncByGroupField(config, ds, batchExecutor, ctype, tableItem, dml.getData(), dml.getOld());
+                    for (SchemaItem.FieldItem fieldItem : tableItem.getRelationTableFields().keySet()) {
+                        if (fieldItem.getColumn().getColumnName().equalsIgnoreCase(field)){
+                            fieldNoReference = false;
+                            break out;
+                        }
+                    }
+                    for (SchemaItem.FieldItem fieldItem : tableItem.getAnotherRelationTableFields().keySet()) {
+                        if (fieldItem.getColumn().getColumnName().equalsIgnoreCase(field)){
+                            fieldNoReference = false;
+                            break out;
+                        }
                     }
                 }
-            }
+                if (fieldNoReference){//更新的字段在查询字段(group字段)中未被引用
+                    return;
+                }
 
+                boolean syncByGroup = false;
+                if (!tableItem.getRelationGroupFieldItems().isEmpty()){
+                    syncByGroup = true;
+                } else {
+                    out: for (SchemaItem.RelationFieldsPair fieldsPair : tableItem.getRelationFields()) {
+                        SchemaItem.FieldItem anotherTableRelField = null;
+                        if (!tableItem.getAlias().equals(fieldsPair.getLeftFieldItem().getOwner())) {
+                            anotherTableRelField = fieldsPair.getLeftFieldItem();
+                        } else if (!tableItem.getAlias().equals(fieldsPair.getRightFieldItem().getOwner())) {
+                            anotherTableRelField = fieldsPair.getRightFieldItem();
+                        }
+
+                        for (SchemaItem.FieldItem groupByField : schemaItem.getGroupByFields()) {
+                            if (anotherTableRelField.getOwner().equalsIgnoreCase(groupByField.getOwner()) && anotherTableRelField.getColumn().getColumnName().equalsIgnoreCase(groupByField.getColumn().getColumnName())) {
+                                syncByGroup = true;
+                                break out;
+                            }
+                        }
+                    }
+                }
+                if (syncByGroup) {
+                    syncByGroupField(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
+                    syncByGroupField(config, ds, batchExecutor, ctype, tableItem, dml.getData(), dml.getOld());
+                } else {
+                    syncByPreviewGroup(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
+                    syncByPreviewGroup(config, ds, batchExecutor, ctype, tableItem, dml.getData(), dml.getOld());
+                }
+            }
         } else {//无group by
             if (schemaItem.getAliasTableItems().size() == 1 && schemaItem.isAllFieldsSimple()){//单表&&所有字段都是简单字段
                 singleTableSimpleFieldUpdate(config, batchExecutor, ctype, dml);
@@ -334,7 +367,7 @@ public class SyncService {
                 boolean mainTableFieldNoReference = true;//更新字段在主表查询字段中无引用
                 out: for (SchemaItem.FieldItem fieldItem : schemaItem.getMainTable().getRelationSelectFieldItems()) {
                     for (SchemaItem.ColumnItem columnItem : fieldItem.getColumnItems()) {
-                        if (columnItem.getOwner().equalsIgnoreCase(schemaItem.getMainTable().getAlias())
+                        if ((columnItem.getOwner() != null && columnItem.getOwner().equalsIgnoreCase(schemaItem.getMainTable().getAlias()))
                                 && dml.getOld().containsKey(columnItem.getColumnName())){
                             mainTableFieldNoReference = false;
                             break out;
@@ -356,7 +389,7 @@ public class SyncService {
                     boolean fieldNoReference = true;//更新的字段在查询字段无引用
                     out: for (SchemaItem.FieldItem fieldItem : tableItem.getRelationSelectFieldItems()) {
                         for (SchemaItem.ColumnItem columnItem : fieldItem.getColumnItems()) {
-                            if (columnItem.getOwner().equalsIgnoreCase(tableItem.getAlias())
+                            if ((columnItem.getOwner() != null && columnItem.getOwner().equalsIgnoreCase(tableItem.getAlias()))
                                     && dml.getOld().containsKey(columnItem.getColumnName())){
                                 fieldNoReference = false;
                                 break out;
@@ -398,23 +431,34 @@ public class SyncService {
         Map<String, Integer> ctype = getTargetColumnType(batchExecutor.getDataSource(), config);
 
         if (schemaItem.isGroup()) {//有group by
-            boolean execTruncate = false;//是否执行清空目标表
-
             for (SchemaItem.TableItem tableItem : schemaItem.getAliasTableItems().values()) {
-                if (tableItem.getTableName().equalsIgnoreCase(dml.getTable())
-                        && tableItem.getRelationGroupFieldItems().isEmpty()) {
-                    execTruncate = true;
-                    break;
+                if (!tableItem.getTableName().equalsIgnoreCase(dml.getTable())) {
+                    continue;
                 }
-            }
+                boolean syncByGroup = false;
+                if (!tableItem.getRelationGroupFieldItems().isEmpty()){
+                    syncByGroup = true;
+                } else {
+                    out: for (SchemaItem.RelationFieldsPair fieldsPair : tableItem.getRelationFields()) {
+                        SchemaItem.FieldItem anotherTableRelField = null;
+                        if (!tableItem.getAlias().equals(fieldsPair.getLeftFieldItem().getOwner())) {
+                            anotherTableRelField = fieldsPair.getLeftFieldItem();
+                        } else if (!tableItem.getAlias().equals(fieldsPair.getRightFieldItem().getOwner())) {
+                            anotherTableRelField = fieldsPair.getRightFieldItem();
+                        }
 
-            if (execTruncate){
-                truncateAndInsert(config, ds, batchExecutor, ctype);
-            } else {
-                for (SchemaItem.TableItem tableItem : schemaItem.getAliasTableItems().values()) {
-                    if (tableItem.getTableName().equalsIgnoreCase(dml.getTable())) {
-                        syncByGroupField(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
+                        for (SchemaItem.FieldItem groupByField : schemaItem.getGroupByFields()) {
+                            if (anotherTableRelField.getOwner().equalsIgnoreCase(groupByField.getOwner()) && anotherTableRelField.getColumn().getColumnName().equalsIgnoreCase(groupByField.getColumn().getColumnName())) {
+                                syncByGroup = true;
+                                break out;
+                            }
+                        }
                     }
+                }
+                if (syncByGroup) {
+                    syncByGroupField(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
+                } else {
+                    syncByPreviewGroup(config, ds, batchExecutor, ctype, tableItem, dml.getData(), null);
                 }
             }
         } else {//无group by
@@ -451,6 +495,30 @@ public class SyncService {
                     columnType = SyncUtil.getColumnTypeMap(dataSource
                             , SyncUtil.getDbTableName(config.getDbMapping()));
                     columnsTypeCache.put(cacheKey, columnType);
+                }
+            }
+        }
+        return columnType;
+    }
+
+    /**
+     * 获取源表字段类型
+     *
+     * @param config
+     * @param tableItem
+     * @return 字段sqlType
+     */
+    private Map<String, Integer> getSourceColumnType(MappingConfig config, SchemaItem.TableItem tableItem) {
+        DataSource dataSource = DatasourceConfig.DATA_SOURCES.get(config.getDataSourceKey());
+        String cacheKey = config.getDataSourceKey() + "." + tableItem.getSchema() + "." + tableItem.getTableName();
+        Map<String, Integer> columnType = sourceColumnsTypeCache.get(cacheKey);
+        if (columnType == null) {
+            synchronized (SyncService.class) {
+                columnType = sourceColumnsTypeCache.get(cacheKey);
+                if (columnType == null) {
+                    columnType = SyncUtil.getColumnTypeMap(dataSource
+                            , SyncUtil.getDbTableName(tableItem.getSchema(), tableItem.getTableName()));
+                    sourceColumnsTypeCache.put(cacheKey, columnType);
                 }
             }
         }
@@ -679,10 +747,13 @@ public class SyncService {
         if (config.getDbMapping().getDeleteCondition() != null && !config.getDbMapping().getDeleteCondition().isEmpty()){
             deleteSql.append(config.getDbMapping().getDeleteCondition()).append(" AND ");
         }
-        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationGroupFieldItems()) {
+        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationGroupFieldItems()) {//where条件中组装该表的group字段
             SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
             List<SchemaItem.FieldItem> fieldItems = schemaItem.getColumnFields().get(columnItem.getOwner() + "." + columnItem.getColumnName());//group字段相关的查询字段
             for (SchemaItem.FieldItem item : fieldItems) {
+                if (item.isMethod() || item.isBinaryOp()){
+                    continue;
+                }
                 String targetFieldName = item.getFieldName();
                 deleteSql.append(targetFieldName);
                 Object value = getValue(columnItem.getColumnName(), data, old);
@@ -698,6 +769,41 @@ public class SyncService {
                 }
             }
         }
+        for (SchemaItem.RelationFieldsPair fieldsPair : tableItem.getRelationFields()) {//where条件中组装被该表关联且被group引用的字段
+            SchemaItem.FieldItem anotherTableRelField = null;
+            if (!tableItem.getAlias().equals(fieldsPair.getLeftFieldItem().getOwner())) {
+                anotherTableRelField = fieldsPair.getLeftFieldItem();
+            } else if (!tableItem.getAlias().equals(fieldsPair.getRightFieldItem().getOwner())) {
+                anotherTableRelField = fieldsPair.getRightFieldItem();
+            }
+
+            for (SchemaItem.FieldItem groupByField : schemaItem.getGroupByFields()) {
+                if (anotherTableRelField.getOwner().equalsIgnoreCase(groupByField.getOwner()) && anotherTableRelField.getColumn().getColumnName().equalsIgnoreCase(groupByField.getColumn().getColumnName())){
+                    SchemaItem.ColumnItem columnItem = groupByField.getColumn();
+                    List<SchemaItem.FieldItem> fieldItems = schemaItem.getColumnFields().get(columnItem.getOwner() + "." + columnItem.getColumnName());//group字段相关的查询字段
+                    for (SchemaItem.FieldItem item : fieldItems) {
+                        if (item.isMethod() || item.isBinaryOp()){
+                            continue;
+                        }
+                        String targetFieldName = item.getFieldName();
+                        deleteSql.append(targetFieldName);
+                        Object value = getValue(columnItem.getColumnName(), data, old);
+                        if (value == null){
+                            deleteSql.append(" IS NULL AND ");
+                        } else {
+                            deleteSql.append(" = ? AND ");
+                            Integer type = ctype.get(targetFieldName);
+                            if (type == null) {
+                                throw new RuntimeException("Target column: " + targetFieldName + " not matched");
+                            }
+                            BatchExecutor.setValue(deleteParams, type, value);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         int len = deleteSql.length();
         deleteSql.delete(len - 4, len);
         batchExecutor.execute(deleteSql.toString(), deleteParams);
@@ -708,7 +814,7 @@ public class SyncService {
         //拼接查询sql
         List<Object> selectParams = new ArrayList<>();
         StringBuilder selectWhere = new StringBuilder();
-        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationGroupFieldItems()) {
+        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationGroupFieldItems()) {//where条件中组装该表的group字段
             SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
             selectWhere.append(columnItem.getOwner()).append(".").append(columnItem.getColumnName());
             Object value = getValue(columnItem.getColumnName(), data, old);
@@ -731,6 +837,42 @@ public class SyncService {
                 selectParams.add(value);
             }
         }
+        for (SchemaItem.RelationFieldsPair fieldsPair : tableItem.getRelationFields()) {//where条件中组装被该表关联且被group引用的字段
+            SchemaItem.FieldItem anotherTableRelField = null;
+            if (!tableItem.getAlias().equals(fieldsPair.getLeftFieldItem().getOwner())) {
+                anotherTableRelField = fieldsPair.getLeftFieldItem();
+            } else if (!tableItem.getAlias().equals(fieldsPair.getRightFieldItem().getOwner())) {
+                anotherTableRelField = fieldsPair.getRightFieldItem();
+            }
+
+            for (SchemaItem.FieldItem groupByField : schemaItem.getGroupByFields()) {
+                if (anotherTableRelField.getOwner().equalsIgnoreCase(groupByField.getOwner()) && anotherTableRelField.getColumn().getColumnName().equalsIgnoreCase(groupByField.getColumn().getColumnName())){
+                    SchemaItem.ColumnItem columnItem = groupByField.getColumn();
+                    selectWhere.append(columnItem.getOwner()).append(".").append(columnItem.getColumnName());
+                    Object value = getValue(columnItem.getColumnName(), data, old);
+                    if (value == null){
+                        selectWhere.append(" IS NULL AND ");
+                    } else {
+                        selectWhere.append(" = ? AND ");
+                        String targetFieldName = null;
+                        for (SchemaItem.FieldItem item : schemaItem.getColumnFields().get(columnItem.getOwner() + "." + columnItem.getColumnName())) {
+                            if (item.isMethod() || item.isBinaryOp()){
+                                continue;
+                            }
+                            targetFieldName = item.getFieldName();
+                            break;
+                        }
+                        Integer type = ctype.get(targetFieldName);
+                        if (type == null) {
+                            throw new RuntimeException("Target column: " + targetFieldName + " not matched");
+                        }
+                        selectParams.add(value);
+                    }
+                    break;
+                }
+            }
+        }
+
         len = selectWhere.length();
         selectWhere.delete(len - 4, len);
         String selectSql = SyncUtil.injectionWhere(config.getDbMapping().getSql(), selectWhere.toString());
@@ -753,6 +895,9 @@ public class SyncService {
             List<SchemaItem.FieldItem> fieldItems = tableItem.getRelationTableFields().get(fieldItem);//关联前表的on字段相关的查询字段
             for (SchemaItem.FieldItem item : fieldItems) {
                 if (item.isBinaryOp() || item.isMethod()){
+                    continue;
+                }
+                if (item.getOwner().equalsIgnoreCase(tableItem.getAlias())){//删除时候where条件字段取左表
                     continue;
                 }
                 String targetFieldName = item.getFieldName();
@@ -804,6 +949,9 @@ public class SyncService {
                     if (item.isBinaryOp() || item.isMethod()){
                         continue;
                     }
+                    if (item.getOwner().equalsIgnoreCase(tableItem.getAlias())){//这段判断加不加无所谓 但还是取左表字段的类型
+                        continue;
+                    }
                     targetFieldName = item.getFieldName();
                     break;
                 }
@@ -822,6 +970,128 @@ public class SyncService {
         String selectSql = SyncUtil.injectionWhere(config.getDbMapping().getSql(), selectWhere.toString());
 
         searchAndInsertTargetTable(config, ds, batchExecutor, ctype, selectSql, selectParams);
+    }
+
+    private void syncByPreviewGroup(MappingConfig config, DataSource ds, BatchExecutor batchExecutor, Map<String, Integer> ctype
+            , SchemaItem.TableItem tableItem, Map<String, Object> data, Map<String, Object> old) throws SQLException{
+        SchemaItem schemaItem = config.getDbMapping().getSchemaItem();
+        //拼接查询sql
+        List<Object> selectParams = new ArrayList<>();
+        StringBuilder selectWhere = new StringBuilder();
+        for (SchemaItem.FieldItem fieldItem : tableItem.getRelationTableFields().keySet()) {
+            SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
+            SchemaItem.ColumnItem leftColumnItem = null;//对应的关联字段
+            for (SchemaItem.RelationFieldsPair relationField : tableItem.getRelationFields()) {
+                if (relationField.getLeftFieldItem() == fieldItem){
+                    leftColumnItem = relationField.getRightFieldItem().getColumn();
+                    break;
+                }
+                if (relationField.getRightFieldItem() == fieldItem){
+                    leftColumnItem = relationField.getLeftFieldItem().getColumn();
+                    break;
+                }
+            }
+            selectWhere.append(leftColumnItem.getOwner()).append(".").append(leftColumnItem.getColumnName());
+            Object value = getValue(columnItem.getColumnName(), data, old);
+            if (value == null){
+                selectWhere.append(" IS NULL AND ");
+            } else {
+                selectWhere.append(" = ? AND ");
+                Integer type = getSourceColumnType(config, schemaItem.getAliasTableItems().get(leftColumnItem.getOwner())).get(leftColumnItem.getColumnName());
+                if (type == null) {
+                    throw new RuntimeException("Source column: " + leftColumnItem.getColumnName() + " not matched");
+                }
+                selectParams.add(value);
+            }
+        }
+        int len = selectWhere.length();
+        selectWhere.delete(len - 4, len);
+        String selectSql = SyncUtil.injectionWhere(config.getDbMapping().getSql(), selectWhere.toString());
+        if (logger.isTraceEnabled()) {
+            logger.trace("select from source database, sql: {}", selectSql);
+        }
+
+        Util.sqlRS(ds, selectSql, selectParams, rs->{
+            try {
+                while (rs.next()) {
+                    //删除目标表
+                    List<Map<String, ?>> deleteParams = new ArrayList<>();
+                    StringBuilder deleteSql = new StringBuilder();
+                    deleteSql.append("DELETE FROM ").append(SyncUtil.getDbTableName(config.getDbMapping())).append(" WHERE ");
+                    if (config.getDbMapping().getDeleteCondition() != null && !config.getDbMapping().getDeleteCondition().isEmpty()){
+                        deleteSql.append(config.getDbMapping().getDeleteCondition()).append(" AND ");
+                    }
+                    for (SchemaItem.FieldItem fieldItem : schemaItem.getGroupByFields()) {//where条件中组装该表的group字段
+                        SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
+                        List<SchemaItem.FieldItem> fieldItems = schemaItem.getColumnFields().get(columnItem.getOwner() + "." + columnItem.getColumnName());//group字段相关的查询字段
+                        for (SchemaItem.FieldItem item : fieldItems) {
+                            if (item.isMethod() || item.isBinaryOp()){
+                                continue;
+                            }
+                            String targetFieldName = item.getFieldName();
+                            deleteSql.append(targetFieldName);
+                            Object value = rs.getObject(targetFieldName);
+                            if (value == null){
+                                deleteSql.append(" IS NULL AND ");
+                            } else {
+                                deleteSql.append(" = ? AND ");
+                                Integer type = ctype.get(targetFieldName);
+                                if (type == null) {
+                                    throw new RuntimeException("Target column: " + targetFieldName + " not matched");
+                                }
+                                BatchExecutor.setValue(deleteParams, type, value);
+                            }
+                        }
+                    }
+                    int length = deleteSql.length();
+                    deleteSql.delete(length - 4, length);
+                    batchExecutor.execute(deleteSql.toString(), deleteParams);
+                    if (logger.isTraceEnabled()) {
+                        logger.trace("delete target table, sql: {}", deleteSql.toString());
+                    }
+
+                    //拼接查询sql
+                    List<Object> groupSelectParams = new ArrayList<>();
+                    StringBuilder groupSelectWhere = new StringBuilder();
+                    for (SchemaItem.FieldItem fieldItem : schemaItem.getGroupByFields()) {//where条件中组装该表的group字段
+                        SchemaItem.ColumnItem columnItem = fieldItem.getColumn();
+                        groupSelectWhere.append(columnItem.getOwner()).append(".").append(columnItem.getColumnName());
+
+                        String targetFieldName = null;
+                        for (SchemaItem.FieldItem item : schemaItem.getColumnFields().get(columnItem.getOwner() + "." + columnItem.getColumnName())) {
+                            if (item.isMethod() || item.isBinaryOp()){
+                                continue;
+                            }
+                            targetFieldName = item.getFieldName();
+                            break;
+                        }
+                        if (targetFieldName == null){
+                            throw new RuntimeException("Source column: " + fieldItem.getExpr() + " do not have  select field");
+                        }
+
+                        Object value = rs.getObject(targetFieldName);
+                        if (value == null){
+                            groupSelectWhere.append(" IS NULL AND ");
+                        } else {
+                            groupSelectWhere.append(" = ? AND ");
+                            Integer type = ctype.get(targetFieldName);
+                            if (type == null) {
+                                throw new RuntimeException("Target column: " + targetFieldName + " not matched");
+                            }
+                            groupSelectParams.add(value);
+                        }
+                    }
+                    length = groupSelectWhere.length();
+                    groupSelectWhere.delete(length - 4, length);
+                    String groupSelectSql = SyncUtil.injectionWhere(config.getDbMapping().getSql(), groupSelectWhere.toString());
+
+                    searchAndInsertTargetTable(config, ds, batchExecutor, ctype, groupSelectSql, groupSelectParams);
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            return 0;
+        });
     }
 
     private Object getValue(String key, Map<String, Object> data, Map<String, Object> old){

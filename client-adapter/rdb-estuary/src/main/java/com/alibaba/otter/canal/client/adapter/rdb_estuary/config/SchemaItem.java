@@ -284,22 +284,20 @@ public class SchemaItem {
                             }
 
                             if (currentTableRelField != null) {
-                                List<FieldItem> selectFieldItem = getSchemaItem().getColumnFields()
+                                List<FieldItem> fieldItems = new ArrayList<>();
+
+                                List<FieldItem> leftSelectFieldItem = getSchemaItem().getColumnFields()
                                     .get(leftFieldItem.getOwner() + "." + leftFieldItem.getColumn().getColumnName());
-                                if (selectFieldItem != null && !selectFieldItem.isEmpty()) {
-                                    relationTableFields.put(currentTableRelField, selectFieldItem);
-                                } else {
-                                    selectFieldItem = getSchemaItem().getColumnFields()
-                                        .get(rightFieldItem.getOwner() + "."
-                                             + rightFieldItem.getColumn().getColumnName());
-                                    if (selectFieldItem != null && !selectFieldItem.isEmpty()) {
-                                        relationTableFields.put(currentTableRelField, selectFieldItem);
-                                    } else {
-                                        relationTableFields.put(currentTableRelField, new ArrayList<>());
-//                                        throw new UnsupportedOperationException(
-//                                            "Relation condition column must in select columns.");
-                                    }
+                                if (leftSelectFieldItem != null && !leftSelectFieldItem.isEmpty()) {
+                                    fieldItems.addAll(leftSelectFieldItem);
                                 }
+                                List<FieldItem> rightSelectFieldItem = getSchemaItem().getColumnFields()
+                                        .get(rightFieldItem.getOwner() + "." + rightFieldItem.getColumn().getColumnName());
+                                if (rightSelectFieldItem != null && !rightSelectFieldItem.isEmpty()) {
+                                    fieldItems.addAll(rightSelectFieldItem);
+                                }
+
+                                relationTableFields.put(currentTableRelField, fieldItems);
                             }
                         });
                     }

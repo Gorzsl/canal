@@ -62,6 +62,9 @@ dbMapping:
 7. 如果使用了group by,group by的字段不可为做任何计算,group 字段必须在查询字段中体现(简单字段)
 8. 非group by模式必须设置主键，主键字段在目标表允许重复，主键字段必须设置在主表上，且不可被更新
 9. 如果需要使用union all的话，建议在unionAll语句的各个分段中添加常量字段，然后每个分段分别添加相应的配置文件指向同一个目标表，并且配置deleteCondition(例如:常量字段在目标表的字段名=分段对应的常量值)
+10. 使用group by 需要确保符合only_full_group_by
+11. group by模式下，主表必须有字段体现在group中
+12. 每张表最好都是用别名，每个字段需要标识自己来自于哪张表
 
 # 执行逻辑：
 ## insert:
@@ -69,15 +72,17 @@ dbMapping:
     1. sql语句中只有单一表&所有查询字段均为简单字段：目标表执行insert value(dml.data)
     2. 插入的表是主表：执行查询(原始sql注入where主键=dml.data.主键值) 查询结果插入目标表
     3. 非主表：遍历从表匹配表名(有同名表需要执行多次) 
-        1. 目标表执行 delete where on字段(关联前表的字段对应的查询字段) = dml.data.相关字段的值
-        2. 执行查询(原始sql注入where on字段(关联前表的字段)=dml.data.相关字段的值) 查询结果插入目标表
+        1. 目标表执行 delete where on字段(对应的查询字段) = dml.data.相关字段的值
+        2. 执行查询(原始sql注入where on字段(前表的关联字段) = dml.data.相关字段的值) 查询结果插入目标表
 2. 有group
-    1. 该表在group中有字段涉及：
-        1. 目标表执行 delete where group字段=dml.data.相关字段的值
-        2. 执行查询(原始sql注入where group字段=dml.data.相关字段的值)
-    2. 该表在group中无字段涉及：
-        1. 清空目标表
-        2. 执行原始sql 查询结果插入目标表
+    1. 在group中该表/该表关联的前表字段有字段涉及：
+        1. 目标表执行 delete where group字段 = dml.data.相关字段的值
+        2. 执行查询(原始sql注入where group字段 = dml.data.相关字段的值) 查询结果插入目标表
+    2. 均无涉及
+        1. 执行查询(原始sql注入where on字段(关联前表的字段) = dml.data.相关字段的值)
+        2. 循环查询结果
+            1. 目标表执行 delete where 所有group字段 = 查询结果
+            2. 执行查询(原始sql注入where 所有group字段 = 查询结果) 查询结果插入目标表
     
 ## update：
 1. 无group
@@ -88,37 +93,45 @@ dbMapping:
     3. 非主表：遍历所有表匹配表名(有同名表需要执行多次)
         1. 更新的字段在 查询字段/关联前表的字段 中无引用：跳过
         2. 关联前表的字段没有发生更新
-            1. 目标表执行 delete where 该表关联前表的字段 = dml.data.相关字段的值
-            2. 执行查询(sql注入where 该表关联前表的字段 = dml.data.相关字段的值) 查询结果插入目标表
+            1. 目标表执行 delete where on字段(对应的查询字段) = dml.data.相关字段的值
+            2. 执行查询(原始sql注入where on字段(前表的关联字段) = dml.data.相关字段的值) 查询结果插入目标表
         3. 关联前表的字段发生了更新：
-            1. 目标表执行 delete where 该表关联前表的字段 = dml.data.相关字段的值
-            2. 执行查询(sql注入where 该表关联前表的字段 = dml.data.相关字段的值) 查询结果插入目标表
-            3. 目标表执行 delete where 该表关联前表的字段 = dml.old.相关字段的值
-            4. 执行查询(sql注入where 该表关联前表的字段 = dml.old.相关字段的值) 查询结果插入目标表
+            1. 目标表执行 delete where on字段(对应的查询字段) = dml.data.相关字段的值
+            2. 执行查询(原始sql注入where on字段(前表的关联字段) = dml.data.相关字段的值) 查询结果插入目标表
+            3. 目标表执行 delete where on字段(对应的查询字段) = dml.old.相关字段的值
+            4. 执行查询(sql注入where on字段(前表的关联字段) = dml.old.相关字段的值) 查询结果插入目标表
 2. 有group
     1. 更新的字段在查询字段/关联前后表的字段中无引用：continue
-    2. 该表在group中有字段涉及：
-        1. 目标表执行 delete where group字段=dml.data.相关字段的值
-        2. 执行查询(原始sql注入where group字段=dml.data.相关字段的值) 查询结果插入目标表
-        3. 目标表执行 delete where group字段=dml.old.相关字段的值
-        4. 执行查询(原始sql注入where group字段=dml.old.相关字段的值) 查询结果插入目标表
-    3. 该表在group中无字段涉及：
-        1. 清空目标表
-        2. 执行原始sql 查询结果插入目标表
+    2. 在group中该表/该表关联的前表字段有字段涉及：
+        1. 目标表执行 delete where group字段 = dml.data.相关字段的值
+        2. 执行查询(原始sql注入where group字段 = dml.data.相关字段的值) 查询结果插入目标表
+        3. 目标表执行 delete where group字段 = dml.old.相关字段的值
+        4. 执行查询(原始sql注入where group字段 = dml.old.相关字段的值) 查询结果插入目标表
+    3. 均无涉及：
+        1. 执行查询(原始sql注入where on字段(关联前表的字段) = dml.data.相关字段的值)
+        2. 循环查询结果
+            1. 目标表执行 delete where 所有group字段 = 查询结果
+            2. 执行查询(原始sql注入where 所有group字段 = 查询结果) 查询结果插入目标表
+        3. 执行查询(原始sql注入where on字段(关联前表的字段) = dml.old.相关字段的值)
+        4. 循环查询结果
+            1. 目标表执行 delete where 所有group字段 = 查询结果
+            2. 执行查询(原始sql注入where 所有group字段 = 查询结果) 查询结果插入目标表
 
 ## delete:
 1. 无group
     1. 是主表：目标表执行delete where 主键=dml.data.主键的值
     2. 非主表：遍历从表匹配表名(有同名表需要执行多次)
-        1. 目标表执行delete where on字段(关联前表的字段对应的查询字段) = dml.data.相关字段的值
-        2. 执行查询(原始sql注入where on字段(关联前表的字段)=dml.data.相关字段的值) 查询结果插入目标表
+        1. 目标表执行 delete where on字段(对应的查询字段) = dml.data.相关字段的值
+        2. 执行查询(原始sql注入where on字段(前表的关联字段) = dml.data.相关字段的值) 查询结果插入目标表
 2. 有group
-    1. 该表在group中有涉及字段：
-            1. 目标表执行 delete where group字段=dml.data.value
-            2. 执行查询(原始sql注入where group字段=dml.data.value)
-    2. 该表在group中有涉及字段：
-        1. 清空目标表
-        2. 执行原始sql 查询结果插入目标表
+    1. 在group中该表/该表关联的前表字段有字段涉及：
+        1. 目标表执行 delete where group字段 = dml.data.相关字段的值
+        2. 执行查询(原始sql注入where group字段 = dml.data.相关字段的值) 查询结果插入目标表
+    2. 均无涉及
+        1. 执行查询(原始sql注入where on字段(关联前表的字段) = dml.data.相关字段的值)
+        2. 循环查询结果
+            1. 目标表执行 delete where 所有group字段 = 查询结果
+            2. 执行查询(原始sql注入where 所有group字段 = 查询结果) 查询结果插入目标表
         
         
         
@@ -131,6 +144,4 @@ left join t_product t2
 on t1.prod_code = t2.prod_code
 group by t1.main_id;
 ```
-如果触发dml的表没有字段体现在group列表中 那么则没有足够信息缩小同步范围 只能做全量同步
-
 不符合规范的表可以考虑提供监听相关表做清空重插
