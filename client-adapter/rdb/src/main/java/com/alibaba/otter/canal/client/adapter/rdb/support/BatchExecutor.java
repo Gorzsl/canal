@@ -1,5 +1,9 @@
 package com.alibaba.otter.canal.client.adapter.rdb.support;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.sql.DataSource;
 import java.io.Closeable;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -8,11 +12,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import javax.sql.DataSource;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * sql批量执行器
@@ -36,7 +35,7 @@ public class BatchExecutor implements Closeable {
         if (conn == null) {
             try {
                 conn = dataSource.getConnection();
-                this.conn.setAutoCommit(false);
+                this.conn.setAutoCommit(true);
             } catch (SQLException e) {
                 logger.error(e.getMessage(), e);
             }

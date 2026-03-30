@@ -1,5 +1,15 @@
 package com.alibaba.otter.canal.client.adapter.support;
 
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import org.apache.commons.lang.StringUtils;
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.sql.DataSource;
 import java.io.File;
 import java.net.URL;
 import java.sql.*;
@@ -14,18 +24,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
-import javax.sql.DataSource;
-
-import org.apache.commons.lang.StringUtils;
-import org.joda.time.DateTime;
-import org.joda.time.DateTimeZone;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
-
 public class Util {
 
     private static final Logger logger = LoggerFactory.getLogger(Util.class);
@@ -34,11 +32,13 @@ public class Util {
      * 通过DS执行sql
      */
     public static Object sqlRS(DataSource ds, String sql, Function<ResultSet, Object> fun) {
-        try (Connection conn = ds.getConnection();
-                Statement stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
-            stmt.setFetchSize(Integer.MIN_VALUE);
-            try (ResultSet rs = stmt.executeQuery(sql)) {
-                return fun.apply(rs);
+        try (Connection conn = ds.getConnection()){
+            conn.setAutoCommit(false);
+            try (Statement stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
+                stmt.setFetchSize(10);
+                try (ResultSet rs = stmt.executeQuery(sql)) {
+                    return fun.apply(rs);
+                }
             }
         } catch (Exception e) {
             logger.error("sqlRs has error, sql: {} ", sql);
@@ -48,9 +48,10 @@ public class Util {
 
     public static Object sqlRS(DataSource ds, String sql, List<Object> values, Function<ResultSet, Object> fun) {
         try (Connection conn = ds.getConnection()) {
+            conn.setAutoCommit(false);
             try (PreparedStatement pstmt = conn
                 .prepareStatement(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY)) {
-                pstmt.setFetchSize(Integer.MIN_VALUE);
+                pstmt.setFetchSize(10);
                 if (values != null) {
                     for (int i = 0; i < values.size(); i++) {
                         pstmt.setObject(i + 1, values.get(i));
